@@ -2,33 +2,79 @@
 Async memory extractor for Memory SDK.
 """
 
-import json
 import logging
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from uuid import uuid4
 
 from memory_sdk.config import MemoryConfig
 from memory_sdk.embeddings.provider import EmbeddingProvider
-from memory_sdk.extraction.strategies import DEFAULT_STRATEGIES, Strategy
 from memory_sdk.models import Memory, Message, ExtractionResult
 
 logger = logging.getLogger(__name__)
 
 
 class MemoryExtractor:
-    """Extracts structured memories from conversations using LLMs."""
+    """Extracts user information from conversations using LLMs."""
     
+    # System prompt for memory extraction
+    SYSTEM_PROMPT = """
+##Your Role##
+You are user's long-term memory assistant. Your job is to build and maintain a user's long-term memory.
+
+##YOUR TASK##
+- Extract user's information from the RECENT SESSION and create/update the user's long-term memory.
+
+#CRITICAL RULES#
+1. If EXISTING LONG-TERM MEMORY is empty: Create new memory from the session
+2. If EXISTING LONG-TERM MEMORY exists: UPDATE and APPEND new information
+3. NEVER REMOVE existing information - only add or update
+4. If a field has new value, update it (e.g., job changed from "Engineer" to "Senior Engineer")
+5. For list items: APPEND new items, keep existing ones
+6. Output in clean Markdown format (see OUTPUT FORMAT below)
+
+##Key Points - Personify the User##
+Extract everything that helps personify the user:
+- Name, job, company, location
+- Likes, dislikes, preferences
+- Activities, interests, hobbies
+- Goals, dreams, aspirations
+- Fears, challenges, struggles
+- Strengths, weaknesses
+- Values, beliefs
+- Habits, routines
+- Important facts
+- Relationships, family
+- Any other personal information
+
+##OUTPUT FORMAT##
+Return ONLY the user memory in this Markdown format (omit sections with no info):
+
+## About ##
+Personify the user. get its name, job, company, location, etc. all teh personal details realted to him.
+
+## Interests & Preferences
+- [Interest/preference 1]
+- [Interest/preference 2]
+
+## Facts
+- [Fact 1]
+- [Fact 2]
+
+## Goals & Aspirations
+- [Goal 1]
+
+## Other
+- [Any other relevant info]"""
+
     def __init__(
         self,
         config: MemoryConfig,
         embedding_provider: EmbeddingProvider,
-        strategies: Optional[Dict[str, Strategy]] = None,
     ):
         self.config = config
         self.embedding_provider = embedding_provider
-        self.strategies = strategies or DEFAULT_STRATEGIES
         self._llm_client = None
     
     @property
@@ -51,47 +97,31 @@ class MemoryExtractor:
     def _build_extraction_prompt(
         self,
         messages: List[Message],
-        strategy: Strategy,
-        existing_memory: Optional[Memory] = None,
+        existing_memory: Optional[str] = None,
     ) -> str:
-        """Build the extraction prompt."""
+        """Build the user prompt with task-specific data."""
         # Format conversation
         conversation = "\n".join([
             f"{msg.role.value.upper()}: {msg.content}"
             for msg in messages
         ])
         
-        # Format existing memory
-        existing_str = ""
+        # Format existing memory (already Markdown string)
         if existing_memory:
-            existing_str = f"""
-EXISTING {strategy.name.upper()} DATA:
-{json.dumps(existing_memory.content, indent=2)}
-
-Update and merge this with any new information from the conversation.
-"""
+            existing_section = f"""#EXISTING LONG-TERM MEMORY#
+{existing_memory}"""
+        else:
+            existing_section = """#EXISTING LONG-TERM MEMORY#
+None - This is a new user with no saved memory yet."""
         
-        return f"""Extract {strategy.name} information from this conversation.
+        return f"""{existing_section}
 
-STRATEGY: {strategy.name}
-DESCRIPTION: {strategy.description}
-
-EXPECTED OUTPUT SCHEMA:
-{json.dumps(strategy.schema, indent=2)}
-{existing_str}
-CONVERSATION:
+#RECENT SESSION (Just Happened)#
 {conversation}
 
-INSTRUCTIONS:
-1. Extract ONLY {strategy.name} information that matches the schema
-2. Return a valid JSON object matching the schema
-3. Include a "summary" field with a plain English summary (1-2 sentences)
-4. If no relevant information found, return {{"summary": null}}
-5. Merge with existing data if provided
-
-Return ONLY the JSON object, no other text."""
+Now output the updated user memory in Markdown format."""
     
-    async def _call_llm(self, prompt: str) -> str:
+    async def _call_llm(self, user_prompt: str) -> str:
         """Call the LLM to extract memories."""
         provider = self.config.llm.provider.lower()
         
@@ -99,12 +129,11 @@ Return ONLY the JSON object, no other text."""
             response = await self.llm_client.chat.completions.create(
                 model=self.config.llm.model,
                 messages=[
-                    {"role": "system", "content": "You are a memory extraction assistant. Extract structured information from conversations."},
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
                 ],
                 temperature=self.config.llm.temperature,
                 max_tokens=self.config.llm.max_tokens,
-                response_format={"type": "json_object"},
             )
             return response.choices[0].message.content
         
@@ -112,8 +141,9 @@ Return ONLY the JSON object, no other text."""
             response = await self.llm_client.messages.create(
                 model=self.config.llm.model,
                 max_tokens=self.config.llm.max_tokens,
+                system=self.SYSTEM_PROMPT,
                 messages=[
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
             )
             return response.content[0].text
@@ -121,113 +151,88 @@ Return ONLY the JSON object, no other text."""
         else:
             raise ValueError(f"Unknown LLM provider: {provider}")
     
-    async def extract_for_strategy(
-        self,
-        user_id: str,
-        session_id: str,
-        messages: List[Message],
-        strategy: Strategy,
-        existing_memory: Optional[Memory] = None,
-    ) -> Optional[Memory]:
-        """Extract memory for a single strategy."""
-        if not strategy.enabled:
-            return None
-        
-        try:
-            # Build prompt
-            prompt = self._build_extraction_prompt(messages, strategy, existing_memory)
-            
-            # Call LLM
-            response = await self._call_llm(prompt)
-            
-            # Parse response
-            data = json.loads(response)
-            
-            # Check if extraction found anything
-            if data.get("summary") is None:
-                return None
-            
-            # Extract summary
-            summary = data.pop("summary", "")
-            if not summary:
-                # Generate summary from content
-                summary = f"{strategy.name}: {json.dumps(data)[:200]}"
-            
-            # Generate embedding from summary
-            embedding = await self.embedding_provider.embed_text(summary)
-            
-            # Create memory
-            memory_id = existing_memory.memory_id if existing_memory else str(uuid4())
-            
-            return Memory(
-                memory_id=memory_id,
-                user_id=user_id,
-                strategy=strategy.name,
-                content=data,
-                summary=summary,
-                embedding=embedding,
-                confidence=1.0,
-                created_at=existing_memory.created_at if existing_memory else datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-                metadata={"session_id": session_id},
-            )
-        
-        except Exception as e:
-            logger.error(f"Failed to extract {strategy.name}: {e}")
-            return None
-    
     async def extract_memories(
         self,
         user_id: str,
         session_id: str,
         messages: List[Message],
-        existing_memories: Optional[Dict[str, Memory]] = None,
-    ) -> ExtractionResult:
-        """Extract memories from a conversation."""
+        existing_memory: Optional[str] = None,
+    ) -> tuple[ExtractionResult, Optional[Memory]]:
+        """
+        Extract user memory from a conversation.
+        
+        Args:
+            user_id: User identifier
+            session_id: Session identifier
+            messages: List of messages from the session
+            existing_memory: Existing LTM as Markdown string (or None for new user)
+            
+        Returns:
+            Tuple of (ExtractionResult, Memory or None)
+        """
         start_time = time.time()
-        existing_memories = existing_memories or {}
         
-        extracted = []
-        updated = []
-        strategies_processed = []
-        
-        for strategy_name, strategy in self.strategies.items():
-            if not strategy.enabled:
-                continue
-            
-            strategies_processed.append(strategy_name)
-            existing = existing_memories.get(strategy_name)
-            
-            memory = await self.extract_for_strategy(
+        if not messages:
+            return ExtractionResult(
                 user_id=user_id,
                 session_id=session_id,
-                messages=messages,
-                strategy=strategy,
-                existing_memory=existing,
+                memories_extracted=0,
+                memories_updated=0,
+                strategies_processed=[],
+                duration_ms=0,
+            ), None
+        
+        try:
+            # Build prompt
+            prompt = self._build_extraction_prompt(messages, existing_memory)
+            
+            # Call LLM - returns Markdown string
+            ltm_content = await self._call_llm(prompt)
+            ltm_content = ltm_content.strip()
+            
+            # Generate embedding from the content
+            embedding = await self.embedding_provider.embed_text(ltm_content)
+            
+            # Create single memory object
+            is_update = existing_memory is not None
+            
+            memory = Memory(
+                memory_id=str(uuid4()),
+                user_id=user_id,
+                strategy="user_memory",
+                content=ltm_content,  # Store as string directly
+                summary=ltm_content,   # Same as content for MD format
+                embedding=embedding,
+                confidence=1.0,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+                metadata={"session_id": session_id},
             )
             
-            if memory:
-                if existing:
-                    updated.append(memory)
-                else:
-                    extracted.append(memory)
+            duration_ms = (time.time() - start_time) * 1000
+            
+            return ExtractionResult(
+                user_id=user_id,
+                session_id=session_id,
+                memories_extracted=0 if is_update else 1,
+                memories_updated=1 if is_update else 0,
+                strategies_processed=["user_memory"],
+                duration_ms=duration_ms,
+            ), memory
         
-        duration_ms = (time.time() - start_time) * 1000
-        
-        return ExtractionResult(
-            user_id=user_id,
-            session_id=session_id,
-            memories_extracted=len(extracted),
-            memories_updated=len(updated),
-            strategies_processed=strategies_processed,
-            duration_ms=duration_ms,
-        ), extracted + updated
+        except Exception as e:
+            logger.error(f"Memory extraction failed: {e}")
+            return ExtractionResult(
+                user_id=user_id,
+                session_id=session_id,
+                memories_extracted=0,
+                memories_updated=0,
+                strategies_processed=[],
+                duration_ms=(time.time() - start_time) * 1000,
+            ), None
     
-    def build_context_string(self, memories: List[Memory]) -> str:
-        """Build a context string from memories."""
-        if not memories:
+    def build_context_string(self, memory: Optional[Memory]) -> str:
+        """Build a context string from memory."""
+        if not memory:
             return ""
-        
-        summaries = [m.summary for m in memories if m.summary]
-        return " ".join(summaries)
-
+        return memory.summary or ""

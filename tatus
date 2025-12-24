@@ -1,0 +1,186 @@
+[1mdiff --git a/extraction/extractor.py b/extraction/extractor.py[m
+[1mindex 562f0f7..461e86c 100644[m
+[1m--- a/extraction/extractor.py[m
+[1m+++ b/extraction/extractor.py[m
+[36m@@ -2,33 +2,79 @@[m
+ Async memory extractor for Memory SDK.[m
+ """[m
+ [m
+[31m-import json[m
+ import logging[m
+ import time[m
+ from datetime import datetime[m
+[31m-from typing import Any, Dict, List, Optional[m
+[32m+[m[32mfrom typing import List, Optional[m
+ from uuid import uuid4[m
+ [m
+ from memory_sdk.config import MemoryConfig[m
+ from memory_sdk.embeddings.provider import EmbeddingProvider[m
+[31m-from memory_sdk.extraction.strategies import DEFAULT_STRATEGIES, Strategy[m
+ from memory_sdk.models import Memory, Message, ExtractionResult[m
+ [m
+ logger = logging.getLogger(__name__)[m
+ [m
+ [m
+ class MemoryExtractor:[m
+[31m-    """Extracts structured memories from conversations using LLMs."""[m
+[32m+[m[32m    """Extracts user information from conversations using LLMs."""[m
+     [m
+[32m+[m[32m    # System prompt for memory extraction[m
+[32m+[m[32m    SYSTEM_PROMPT = """[m
+[32m+[m[32m##Your Role##[m
+[32m+[m[32mYou are user's long-term memory assistant. Your job is to build and maintain a user's long-term memory.[m
+[32m+[m
+[32m+[m[32m##YOUR TASK##[m
+[32m+[m[32m- Extract user's information from the RECENT SESSION and create/update the user's long-term memory.[m
+[32m+[m
+[32m+[m[32m#CRITICAL RULES#[m
+[32m+[m[32m1. If EXISTING LONG-TERM MEMORY is empty: Create new memory from the session[m
+[32m+[m[32m2. If EXISTING LONG-TERM MEMORY exists: UPDATE and APPEND new information[m
+[32m+[m[32m3. NEVER REMOVE existing information - only add or update[m
+[32m+[m[32m4. If a field has new value, update it (e.g., job changed from "Engineer" to "Senior Engineer")[m
+[32m+[m[32m5. For list items: APPEND new items, keep existing ones[m
+[32m+[m[32m6. Output in clean Markdown format (see OUTPUT FORMAT below)[m
+[32m+[m
+[32m+[m[32m##Key Points - Personify the User##[m
+[32m+[m[32mExtract everything that helps personify the user:[m
+[32m+[m[32m- Name, job, company, location[m
+[32m+[m[32m- Likes, dislikes, preferences[m
+[32m+[m[32m- Activities, interests, hobbies[m
+[32m+[m[32m- Goals, dreams, aspirations[m
+[32m+[m[32m- Fears, challenges, struggles[m
+[32m+[m[32m- Strengths, weaknesses[m
+[32m+[m[32m- Values, beliefs[m
+[32m+[m[32m- Habits, routines[m
+[32m+[m[32m- Important facts[m
+[32m+[m[32m- Relationships, family[m
+[32m+[m[32m- Any other personal information[m
+[32m+[m
+[32m+[m[32m##OUTPUT FORMAT##[m
+[32m+[m[32mReturn ONLY the user memory in this Markdown format (omit sections with no info):[m
+[32m+[m
+[32m+[m[32m## About ##[m
+[32m+[m[32mPersonify the user. get its name, job, company, location, etc. all teh personal details realted to him.[m
+[32m+[m
+[32m+[m[32m## Interests & Preferences[m
+[32m+[m[32m- [Interest/preference 1][m
+[32m+[m[32m- [Interest/preference 2][m
+[32m+[m
+[32m+[m[32m## Facts[m
+[32m+[m[32m- [Fact 1][m
+[32m+[m[32m- [Fact 2][m
+[32m+[m
+[32m+[m[32m## Goals & Aspirations[m
+[32m+[m[32m- [Goal 1][m
+[32m+[m
+[32m+[m[32m## Other[m
+[32m+[m[32m- [Any other relevant info]"""[m
+[32m+[m
+     def __init__([m
+         self,[m
+         config: MemoryConfig,[m
+         embedding_provider: EmbeddingProvider,[m
+[31m-        strategies: Optional[Dict[str, Strategy]] = None,[m
+     ):[m
+         self.config = config[m
+         self.embedding_provider = embedding_provider[m
+[31m-        self.strategies = strategies or DEFAULT_STRATEGIES[m
+         self._llm_client = None[m
+     [m
+     @property[m
+[36m@@ -51,47 +97,31 @@[m [mclass MemoryExtractor:[m
+     def _build_extraction_prompt([m
+         self,[m
+         messages: List[Message],[m
+[31m-        strategy: Strategy,[m
+[31m-        existing_memory: Optional[Memory] = None,[m
+[32m+[m[32m        existing_memory: Optional[str] = None,[m
+     ) -> str:[m
+[31m-        """Build the extraction prompt."""[m
+[32m+[m[32m        """Build the user prompt with task-specific data."""[m
+         # Format conversation[m
+         conversation = "\n".join([[m
+             f"{msg.role.value.upper()}: {msg.content}"[m
+             for msg in messages[m
+         ])[m
+         [m
+[31m-        # Format existing memory[m
+[31m-        existing_str = ""[m
+[32m+[m[32m        # Format existing memory (already Markdown string)[m
+         if existing_memory:[m
+[31m-            existing_str = f"""[m
+[31m-EXISTING {strategy.name.upper()} DATA:[m
+[31m-{json.dumps(existing_memory.content, indent=2)}[m
+[31m-[m
+[31m-Update and merge this with any new information from the conversation.[m
+[31m-"""[m
+[32m+[m[32m            existing_section = f"""#EXISTING LONG-TERM MEMORY#[m
+[32m+[m[32m{existing_memory}"""[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            existing_section = """#EXISTING LONG-TERM MEMORY#[m
+[32m+[m[32mNone - This is a new user with no saved memory yet."""[m
+         [m
+[31m-        return f"""Extract {strategy.name} information from this conversation.[m
+[31m-[m
+[31m-STRATEGY: {strategy.name}[m
+[31m-DESCRIPTION: {strategy.description}[m
+[32m+[m[32m        return f"""{existing_section}[m
+ [m
+[31m-EXPECTED OUTPUT SCHEMA:[m
+[31m-{json.dumps(strategy.schema, indent=2)}[m
+[31m-{existing_str}[m
+[31m-CONVERSATION:[m
+[32m+[m[32m#RECENT SESSION (Just Happened)#[m
+ {conversation}[m
+ [m
+[31m-INSTRUCTIONS:[m
+[31m-1. Extract ONLY {strategy.name} information that matches the schema[m
+[31m-2. Return a valid JSON object matching the schema[m
+[31m-3. Include a "summary" field with a plain English summary (1-2 sentences)[m
+[31m-4. If no relevant information found, return {{"summary": null}}[m
+[31m-5. Merge with existing data if provided[m
+[31m-[m
+[31m-Return ONLY the JSON object, no other text."""[m
+[32m+[m[32mNow output the updated user memory in Markdown format."""[m
+     [m
+[31m-    async def _call_llm(self, prompt: str) -> str:[m
+[32m+[m[32m    async def _call_llm(self, user_prompt: str) -> str:[m
+         """Call the LLM to extract memories."""[m
+         provider = self.config.llm.provider.lower()[m
+         [m
+[36m@@ -99,12 +129,11 @@[m [mReturn ONLY the JSON object, no other text."""[m
+             response = await self.llm_client.chat.completions.create([m
+                 model=self.config.llm.model,[m
+                 messages=[[m
+[31m-                    {"role": "system", "content": "You are a memory extraction assistant. Extract structured information from conversations."},[m
+[31m-                    {"role": "user", "content": prompt},[m
+[32m+[m[32m                    {"role": "system", "content": self.SYSTEM_PROMPT},[m
+[32m+[m[32m                    {"role": "user", "content": user_prompt},[m
+                 ],[m
+                 temperature=self.config.llm.temperature,[m
+                 max_tokens=self.config.llm.max_tokens,[m
+[31m-                response_format={"type": "json_object"},[m
+             )[m
+             return response.choices[0].message.content[m
+         [m
+[36m@@ -112,8 +141,9 @@[m [mReturn ONLY the JSON object, no other text."""[m
+             response = await self.llm_client.messages.create([m
+                 model=self.config.llm.model,[m
+                 max_tokens=self.config.llm.max_tokens,[m
+[32m+[m[32m                system=self.SYSTEM_PROMPT,[m
+                 messages=[[m
+[31m-                    {"role": "user", "content": prompt},[m
+[32m+[m[32m                    {"role": "user", "content": user_prompt},[m
+                 ],[m
+             )[m
+             return response.content[0].text[m
+[36m@@ -121,113 +151,88 @@[m [mReturn ONLY the JSON object, no other text."""[m
+         else:[m
+             raise ValueError(f"Unknown LLM provider: {provider}")[m
+     [m
+[31m-    async def extract_for_strategy([m
+[32m+[m[32m    async def extract_memories([m
+         self,[m
+         user_id: str,[m
+         session_id: str,[m
+        
